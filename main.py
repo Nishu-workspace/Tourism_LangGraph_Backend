@@ -5,10 +5,17 @@ import json
 import operator
 from typing import TypedDict, Annotated, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from database import (
+    add_vendors,
+    find_vendor_by_id,
+    find_vendor_by_type,
+    ObjectId,
+    find_all_vendors,
+)
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
@@ -155,6 +162,14 @@ def get_itinerary_node(state: TripPlanState) -> dict:
     }
 
 
+def confirm_itinerary_node(state: TripPlanState) -> dict:
+    print("---Confrim Itinerary Node---")
+    ai_message = AIMessage(
+        content="Can you confrim the Itinerary, so we can move forward with other details, Reply with\n `Yes or No."
+    )
+    return {"chat_history": [ai_message], "next-action": "user_provide_confirnmation"}
+
+
 # --- 4. GRAPH DEFINITION AND COMPILATION ---
 
 builder = StateGraph(TripPlanState)
@@ -219,6 +234,25 @@ class ChatResponse(BaseModel):
     is_finished: bool
 
 
+class VendorRegistrationRequest(BaseModel):
+    vendor_type: str = Field(..., example="Driver")
+    business_name: str = Field(..., example="Gujarat Cabs")
+    contact_name: str = Field(..., example="Suresh Patel")
+    mobile_number: str = Field(..., example="9876543210")
+    city: str = Field(..., example="Ahmedabad")
+    summary: str = Field(..., example="AC Sedan for local tours.")
+
+
+class VendorResponse(BaseModel):
+    id: str = Field(..., alias="_id")
+    vendor_type: str
+    business_name: str
+
+    class Config:
+        populate_by_name = True
+        json_encoders = {ObjectId: str}
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     """Main API endpoint for the chat agent."""
@@ -250,3 +284,27 @@ async def chat_endpoint(request: ChatRequest):
 @app.get("/")
 def root():
     return {"status": "online", "message": "Welcome to the Trip Planner API"}
+
+
+@app.post("/vendors", response_model=VendorResponse)
+async def register_vendor(vendor_data: VendorRegistrationRequest):
+    vendor_dict = vendor_data.model_dump()
+    try:
+        new_vendor_id = add_vendors(vendor_dict)
+        created_vendor = find_vendor_by_id(new_vendor_id)
+        if not created_vendor:
+            raise HTTPException(
+                status_code=404, detail="Vendor not fount after creation"
+            )
+        return created_vendor
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/vendors", response_model=List[VendorResponse])
+async def get_vendors(vendor_type: Optional[str] = None):
+    if vendor_type:
+        vendors = find_vendor_by_type(vendor_type)
+    else:
+        vendors = find_all_vendors()
+    return vendors
