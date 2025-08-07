@@ -1,9 +1,12 @@
 # main.py
-
+from datetime import datetime
 import os
 import json
 import operator
 from typing import TypedDict, Annotated, List, Optional
+
+from pydantic import BeforeValidator
+from typing_extensions import Annotated
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +18,7 @@ from database import (
     find_vendor_by_type,
     ObjectId,
     find_all_vendors,
+    find_vendors_by_city_and_type,
 )
 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -36,20 +40,37 @@ llm = ChatGoogleGenerativeAI(model="models/gemini-1.5-flash-latest", temperature
 # --- 2. LANGGRAPH STATE DEFINITION ---
 
 
-class TripPlanState(TypedDict):
+class TripPlanState(BaseModel):
     """Defines the structure of the agent's memory (state)."""
 
-    destination: Optional[str]
-    time_duration: Optional[str]
-    interests: Optional[str]
-    chat_history: Annotated[List[BaseMessage], operator.add]
-    itinerary: Optional[str]
-    missing_info: Optional[str]
-    next_action: Optional[str]
+    destination: str = ""
+    time_duration: str = ""
+    interests: str = ""
+    chat_history: List[BaseMessage] = Field(default_factory=list)
+    itinerary: str = ""
+    missing_info: str = ""
+    next_action: str = ""
+    itinerary_confirmed: bool = False
+
+    fix_request: str = ""
+    driver_details: str = ""
+    hotel_details: str = ""
 
 
 # --- 3. NODE FUNCTIONS ---
 # Each function represents a step or "node" in our agent's thought process.
+def route_from_start(state: TripPlanState) -> str:
+    print("Node: route_from_start")
+    print(f"state: {state}")
+    if state.itinerary and state.itinerary_confirmed:
+        print("Decision: Plan is fixed, routing to arrangement")
+        return "ask_what_to_fix"
+    elif state.itinerary and not state.itinerary_confirmed:
+        print("Decision: Plan proposed but yet to be confirmed")
+        return "confirmation_parse"
+    else:
+        print("Decision: No plan exists, routing to planning")
+        return "planning_branch"
 
 
 def parse_query_node(state: TripPlanState) -> dict:
@@ -66,22 +87,21 @@ def parse_query_node(state: TripPlanState) -> dict:
     2. For any field not found in the conversation (destination, time_duration, interests), you MUST use an empty string "".
 
     CONVERSATION HISTORY:
-    {state['chat_history']}
+    {state.chat_history}
 
     Your response must be a single, valid JSON object.
     """
+
     json_llm = llm.bind(generation_config={"response_mime_type": "application/json"})
     chain = json_llm | StrOutputParser()
     response_str = chain.invoke(prompt)
     parsed_response = json.loads(response_str)
-
+    print(f"Parsed Repsonse {parsed_response}")
     # Always update the state with the latest extracted info
     return {
-        "destination": parsed_response.get("destination", state.get("destination")),
-        "time_duration": parsed_response.get(
-            "time_duration", state.get("time_duration")
-        ),
-        "interests": parsed_response.get("interests", state.get("interests")),
+        "destination": parsed_response.get("destination", state.destination),
+        "time_duration": parsed_response.get("time_duration", state.time_duration),
+        "interests": parsed_response.get("interests", state.interests),
     }
 
 
@@ -90,9 +110,9 @@ def check_details_node(state: TripPlanState) -> dict:
     print("--- NODE: check_details_node ---")
     prompt = f"""
     Check if all info is provided based on the state below.
-    - Destination: {state.get('destination') or 'Not provided'}
-    - Time/Duration: {state.get('time_duration') or 'Not provided'}
-    - Interests: {state.get('interests') or 'Not provided'}
+    - Destination: {state.destination or 'Not provided'}
+    - Time/Duration: {state.time_duration or 'Not provided'}
+    - Interests: {state.interests or 'Not provided'}
     Reply with a comma-separated list of missing fields, or "OK" if nothing is missing.
     """
     response = llm.invoke(prompt)
@@ -102,14 +122,14 @@ def check_details_node(state: TripPlanState) -> dict:
 def router_node(state: TripPlanState) -> str:
     """Routes the conversation to the correct node based on the state."""
     print("--- NODE: router_node ---")
-    missing_info = state.get("missing_info", "").lower()
+    missing_info = (state.missing_info or "").lower()
 
     # Check the actual data fields first for robustness
-    if not state.get("destination"):
+    if not state.destination:
         return "get_destination"
-    if not state.get("time_duration"):
+    if not state.time_duration:
         return "get_time"
-    if not state.get("interests"):
+    if not state.interests:
         return "get_interest"
 
     # If all fields are present, check the LLM's confirmation
@@ -147,45 +167,172 @@ def get_itinerary_node(state: TripPlanState) -> dict:
     print("--- NODE: get_itinerary_node ---")
     prompt = f"""
     Create a detailed trip itinerary based on the following plan:
-    - Destination: {state['destination']}
-    - Duration: {state['time_duration']}
-    - Interests: {state['interests']}
+    - Destination: {state.destination}
+    - Duration: {state.time_duration}
+    - Interests: {state.interests}
     Include local food suggestions, practical travel tips, and a day-by-day schedule.
     """
     response = llm.invoke(prompt)
     itinerary = response.content.strip()
-    ai_message = AIMessage(content=itinerary)
+    ai_message = AIMessage(
+        content=f"Here is a proposed itinerary for your trip:\n\n{itinerary}\n\n Would you like to confrim it or not?"
+    )
     return {
         "itinerary": itinerary,
+        "chat_history": [ai_message],
+        "next_action": "user_provides_confrimation",
+    }
+
+
+# In main.py, replace your handle_confirmation_node with this:
+
+
+def confrimation_parse(state: TripPlanState) -> dict:
+
+    print("--- Node: confirmation_parse ---")
+    user_message = state.chat_history[-1].content
+    prompt = f"""
+    The user was just shown a travel itinerary. Analyze their response to see if they approve it.
+    - If the user's message is positive (e.g., "looks good", "yes", "perfect", "okay", "fine"), respond with 'confirmed'.
+    - If the user's message is negative or asks for changes, respond with 'modify'.
+    User's message: "{user_message}"
+    
+    Your response must be ONLY 'confirmed' or 'modify'.
+    """
+    decision = llm.invoke(prompt).content.strip()
+    print(f"--- Confirmation Decision: {decision} ---")
+    if decision.lower() == "confirmed":
+        return {"itinerary_confirmed": True}
+    else:
+        return {"itinerary_confirmed": False}
+
+
+# Replace this function in main.py
+def confirm_itinerary_node(state: TripPlanState) -> dict:
+    print("--- NODE: confirm_itinerary_node ---")
+    ai_message = AIMessage(
+        content="Great! The itinerary is confirmed. what would you like to arrange now? (e.g., Driver, Hotel, Activities) "
+    )
+    return {
+        "itinerary_confirmed": True,  # CORRECTED TYPO
+        "chat_history": [ai_message],
+        "next_action": "user_provides_arrangement_choice",
+    }
+
+
+# Replace this function in main.py
+def handle_modification_node(state: TripPlanState) -> dict:
+    print("--- NODE: handle_modification_node ---")
+    ai_message = AIMessage(
+        content="I understand. Let's start over to get it right. Please tell me about the trip you'd like to plan."
+    )
+    return {
+        "destination": "",
+        "time_duration": "",  # CORRECTED TYPO
+        "interests": "",
+        "itinerary": "",
+        "itinerary_confirmed": False,  # CORRECTED TYPO
+        "chat_history": [ai_message],
+        "next_action": "user_provides_info",
+    }
+
+
+def arrangement_router_node(state: TripPlanState) -> str:
+    print("--- NODE: arrangement_router_node ---")
+    user_message = state.chat_history[-1].content
+    prompt = f"Does the user want a 'driver' or 'hotel'? Respond with ONLY 'driver', 'hotel', or 'other'. User message: \"{user_message}\""
+    response = llm.invoke(prompt).content.strip()
+    if "driver" in response:
+        return "fix_driver"
+    return "end"  # Failsafe for now
+
+
+def fix_driver_node(state: TripPlanState) -> dict:
+    """
+    Fetches ALL drivers from the database for the trip destination
+    and presents them to the user.
+    """
+    print("--- NODE: fix_driver_node (with simplified DB query) ---")
+
+    destination_city = state.destination
+
+    if not destination_city:
+        ai_message = AIMessage(
+            content="I'm sorry, I don't seem to have a destination for your trip. Could you please clarify where you're going?"
+        )
+        return {"chat_history": [ai_message], "next_action": "finished"}
+
+    # CHANGED: Call the new, simpler database function
+    print(f"--- Querying DB for 'Driver' vendors in '{destination_city}' ---")
+    drivers = find_vendors_by_city_and_type(vendor_type="Driver", city=destination_city)
+
+    # The rest of the function remains the same
+    if not drivers:
+        response_text = f"I'm sorry, I couldn't find any drivers in {destination_city} in our database at the moment."
+    else:
+        response_text = f"✅ Great! I found {len(drivers)} driver(s) for your trip to {destination_city}:\n\n"
+        for i, driver in enumerate(drivers):
+            response_text += (
+                f"**{i+1}. {driver['business_name']}** ({driver['contact_name']})\n"
+            )
+            response_text += f"   - **Service:** {driver['summary']}\n"
+            response_text += f"   - **Contact:** {driver['mobile_number']}\n\n"
+
+    ai_message = AIMessage(content=response_text)
+    return {
+        "driver_details": json.dumps([str(d) for d in drivers]),
         "chat_history": [ai_message],
         "next_action": "finished",
     }
 
 
-def confirm_itinerary_node(state: TripPlanState) -> dict:
-    print("---Confrim Itinerary Node---")
-    ai_message = AIMessage(
-        content="Can you confrim the Itinerary, so we can move forward with other details, Reply with\n `Yes or No."
-    )
-    return {"chat_history": [ai_message], "next-action": "user_provide_confirnmation"}
+# Add this new node function to main.py
+
+
+def start_node(state: TripPlanState) -> dict:
+    """A simple node that just passes the state along. This is our entry point."""
+    print("--- 1. Entering Graph ---")
+    return {}
+
+
+# In main.py, add this new node function
 
 
 # --- 4. GRAPH DEFINITION AND COMPILATION ---
 
 builder = StateGraph(TripPlanState)
 
-# Add nodes to the graph
+# Add ALL nodes to the graph, including the new simple entry point
+builder.add_node("start_node", start_node)
 builder.add_node("parse_query", parse_query_node)
 builder.add_node("check_details", check_details_node)
 builder.add_node("get_destination", get_destination_node)
 builder.add_node("get_time", get_time_node)
 builder.add_node("get_interest", get_interest_node)
 builder.add_node("get_itinerary", get_itinerary_node)
+builder.add_node("confirmation_parse", confrimation_parse)
 
-# Define the graph's workflow and edges
-builder.set_entry_point("parse_query")
+builder.add_node("confirm_itinerary", confirm_itinerary_node)
+builder.add_node("handle_modification", handle_modification_node)
+builder.add_node("arrangement_router", arrangement_router_node)
+builder.add_node("fix_driver", fix_driver_node)
+
+# 1. Set the simple, non-conditional entry point
+builder.set_entry_point("start_node")
+
+# 2. From the start_node, immediately branch based on the master router's decision
+builder.add_conditional_edges(
+    "start_node",
+    route_from_start,
+    {
+        "planning_branch": "parse_query",
+        "confirmation_parse": "confirmation_parse",
+        "ask_what_to_fix": "confirm_itinerary",
+    },
+)
+
+# 3. Define all other edges for the branches
 builder.add_edge("parse_query", "check_details")
-
 builder.add_conditional_edges(
     "check_details",
     router_node,
@@ -197,17 +344,24 @@ builder.add_conditional_edges(
         "end": END,
     },
 )
-
-# After asking a question, the graph's work for this turn is done.
 builder.add_edge("get_destination", END)
 builder.add_edge("get_time", END)
 builder.add_edge("get_interest", END)
 builder.add_edge("get_itinerary", END)
+builder.add_edge("confirmation_parse", "start_node")
 
-# Compile the graph
+builder.add_edge("handle_modification", "parse_query")
+builder.add_edge("confirm_itinerary", END)
+
+builder.add_conditional_edges(
+    "arrangement_router",
+    arrangement_router_node,
+    {"fix_driver": "fix_driver", "end": END},
+)
+builder.add_edge("fix_driver", END)
+
+# Compile the final graph
 graph = builder.compile()
-
-
 # --- 5. FASTAPI APPLICATION ---
 
 app = FastAPI(title="Stateless Trip Planner API")
@@ -222,16 +376,12 @@ app.add_middleware(
 )
 
 
-# Define the structure of the request from the frontend
+PyObjectId = Annotated[str, BeforeValidator(str)]
+
+
+# --- Request Models ---
 class ChatRequest(BaseModel):
-    chat_history: List[dict]  # Expects a list of {"role": "user/ai", "content": "..."}
-
-
-# Define the structure of the response to the frontend
-class ChatResponse(BaseModel):
-    ai_message: str
-    next_action: str
-    is_finished: bool
+    chat_history: List[dict]
 
 
 class VendorRegistrationRequest(BaseModel):
@@ -241,16 +391,36 @@ class VendorRegistrationRequest(BaseModel):
     mobile_number: str = Field(..., example="9876543210")
     city: str = Field(..., example="Ahmedabad")
     summary: str = Field(..., example="AC Sedan for local tours.")
+    portfolio_url: Optional[str] = Field(
+        None, example="http://instagram.com/gujaratroads"
+    )
+    languages: Optional[List[str]] = Field(None, example=["Gujarati", "Hindi"])
+    pan_number: Optional[str] = Field(None, example="ABCDE1234F")
+    gstin: Optional[str] = Field(None, example="22AAAAA0000A1Z5")
+
+
+# --- Response Models ---
+class ChatResponse(BaseModel):
+    ai_message: str
+    next_action: str
+    is_finished: bool
 
 
 class VendorResponse(BaseModel):
-    id: str = Field(..., alias="_id")
+    # This model is now complete and correctly handles ObjectId
+    id: PyObjectId = Field(alias="_id", default=None)
     vendor_type: str
     business_name: str
+    contact_name: str
+    mobile_number: str
+    city: str
+    summary: str
+    status: str
+    registration_date: datetime
 
     class Config:
         populate_by_name = True
-        json_encoders = {ObjectId: str}
+        arbitrary_types_allowed = True
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -296,9 +466,13 @@ async def register_vendor(vendor_data: VendorRegistrationRequest):
             raise HTTPException(
                 status_code=404, detail="Vendor not fount after creation"
             )
+        created_vendor["id"] = str(created_vendor["_id"])
         return created_vendor
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+""
 
 
 @app.get("/vendors", response_model=List[VendorResponse])
